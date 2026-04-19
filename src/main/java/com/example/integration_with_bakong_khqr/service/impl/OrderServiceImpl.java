@@ -1,60 +1,58 @@
 package com.example.integration_with_bakong_khqr.service.impl;
 
+import com.example.integration_with_bakong_khqr.config.BakongProperties;
 import com.example.integration_with_bakong_khqr.constraint.OrderStatus;
 import com.example.integration_with_bakong_khqr.constraint.PaymentMethod;
 import com.example.integration_with_bakong_khqr.model.entity.Order;
+import com.example.integration_with_bakong_khqr.model.response.BakongPaymentResponse;
 import com.example.integration_with_bakong_khqr.repository.OrderRepository;
 import com.example.integration_with_bakong_khqr.service.OrderService;
 
 import kh.gov.nbc.bakong_khqr.BakongKHQR;
-import kh.gov.nbc.bakong_khqr.model.IndividualInfo;
-import kh.gov.nbc.bakong_khqr.model.KHQRCurrency;
-import kh.gov.nbc.bakong_khqr.model.KHQRResponse;
-import kh.gov.nbc.bakong_khqr.model.KHQRData;
+import kh.gov.nbc.bakong_khqr.model.*;
 
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.util.Map;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class OrderServiceImpl implements OrderService {
 
     private final OrderRepository orderRepository;
+    private final BakongProperties bakongProperties;
+    private final RestTemplate bakongRestTemplate;
 
     @Override
     @Transactional
-    public Order generateQRCode(Long id) {
-        // 1. Find or create order
-        Order order = orderRepository.findById(id).orElseGet(() -> {
-            Order newOrder = new Order();
-            newOrder.setAmount(new BigDecimal("0.10"));
-            newOrder.setCurrency("USD");
-            newOrder.setPaymentMethod(PaymentMethod.KHQR);
-            newOrder.setStatus(OrderStatus.PENDING);
-            newOrder.setPaid(false);
-            return orderRepository.save(newOrder);
-        });
+    public Order generateQRCode() { //   no id param
+        // Always create a fresh order
+        Order order = new Order();
+        order.setAmount(new BigDecimal("0.10"));
+        order.setCurrency("USD");
+        order.setPaymentMethod(PaymentMethod.KHQR);
+        order.setStatus(OrderStatus.PENDING);
+        order.setPaid(false);
+        order = orderRepository.save(order);
 
-        // 2. Calculate expiration timestamp (30 seconds from now)
-        long expirationTimestamp = System.currentTimeMillis() + (30 * 1000);
-
-        // 3. Setup Bakong KHQR Info
+        long expirationTimestamp = System.currentTimeMillis() + (60 * 1000);
         IndividualInfo info = new IndividualInfo();
-        info.setBakongAccountId("your_acc@bank");
-        info.setMerchantName("Name");
-        info.setMerchantCity("Phnom Penh");
+        info.setBakongAccountId(bakongProperties.getAccountId());
+        info.setMerchantName(bakongProperties.getMerchantName());
+        info.setMerchantCity(bakongProperties.getMerchantCity());
         info.setAmount(order.getAmount().doubleValue());
         info.setCurrency(KHQRCurrency.USD);
-        info.setExpirationTimestamp(expirationTimestamp); //Required for dynamic KHQR
+        info.setExpirationTimestamp(expirationTimestamp);
 
-        // 4. Generate QR using NBC SDK
         KHQRResponse<KHQRData> response = BakongKHQR.generateIndividual(info);
 
-        // 5. Update order with generated data
         if (response != null && response.getData() != null) {
             KHQRData data = response.getData();
             order.setQrCode(data.getQr());
@@ -63,10 +61,11 @@ public class OrderServiceImpl implements OrderService {
             return orderRepository.save(order);
         } else {
             if (response != null && response.getKHQRStatus() != null) {
-                System.err.println("Bakong Error Code: " + response.getKHQRStatus().getCode());
-                System.err.println("Bakong Error Msg: " + response.getKHQRStatus().getMessage());
+                log.error("Bakong Error {}: {}",
+                        response.getKHQRStatus().getCode(),
+                        response.getKHQRStatus().getMessage());
             }
-            throw new RuntimeException("Bakong SDK failed to generate QR. Check logs.");
+            throw new RuntimeException("Failed to generate QR code.");
         }
     }
 
@@ -76,24 +75,39 @@ public class OrderServiceImpl implements OrderService {
         Order order = orderRepository.findById(id)
                 .orElseThrow(() -> new RuntimeException("Order not found!"));
 
-        // Return immediately if already paid
-        if (Boolean.TRUE.equals(order.getPaid()) && order.getStatus() == OrderStatus.PAID) {
-            return order;
+        if (Boolean.TRUE.equals(order.getPaid())) {
+            return order; // already paid, return immediately
         }
 
-        // Check if QR has expired
-        if (order.getQrExpiration() != null && System.currentTimeMillis() > order.getQrExpiration()) {
-            throw new RuntimeException("QR code has expired.");
+        if (order.getQrExpiration() != null &&
+                System.currentTimeMillis() > order.getQrExpiration()) {
+            return order; // expired, just return — don't throw
         }
 
-        // Verify MD5 hash and mark as paid
-        if (qrMd5 != null && qrMd5.equals(order.getQrMd5())) {
-            order.setPaid(true);
-            order.setStatus(OrderStatus.PAID);
-            order.setPaidAt(LocalDateTime.now());
-            return orderRepository.save(order);
-        } else {
-            throw new RuntimeException("Invalid QR code hash verification.");
+        String url = bakongProperties.getBaseUrl() + "/v1/check_transaction_by_md5";
+        Map<String, String> body = Map.of("md5", qrMd5);
+
+        BakongPaymentResponse apiResponse = bakongRestTemplate.postForObject(
+                url, body, BakongPaymentResponse.class);
+
+        //   NOT paid yet — just return order as-is, don't throw
+        if (apiResponse == null || apiResponse.getResponseCode() != 0) {
+            log.info("Payment not confirmed yet for order {}", id);
+            return order; // still PENDING, frontend keeps polling
         }
+
+        // Payment confirmed!
+        BakongPaymentResponse.Data txn = apiResponse.getData();
+        order.setPaid(true);
+        order.setStatus(OrderStatus.PAID);
+        order.setPaidAt(LocalDateTime.now());
+
+        if (txn != null) {
+            order.setBakongHash(txn.getHash());
+            order.setFromAccountId(txn.getFromAccountId());
+            order.setToAccountId(txn.getToAccountId());
+        }
+
+        return orderRepository.save(order);
     }
 }

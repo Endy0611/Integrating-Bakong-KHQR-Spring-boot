@@ -11,23 +11,23 @@ import java.util.Map; // <-- Added this import
 
 @RestController
 @RequestMapping("/api/orders")
-@CrossOrigin(origins = "*")
+@CrossOrigin(origins = "http://localhost:3000")
+
 @RequiredArgsConstructor
 public class OrderController {
 
     private final OrderService orderService;
 
-    @PostMapping("/{id}/generate_qrcode")
-    public ResponseEntity<?> generateQrCode(@PathVariable Long id) {
-        Order order = orderService.generateQRCode(id);
-        // Using Map.of is great for simple success responses
+    @PostMapping("/generate_qrcode") // no /{id} anymore
+    public ResponseEntity<?> generateQrCode() {
+        Order order = orderService.generateQRCode();
         return ResponseEntity.status(201).body(Map.of(
                 "success", true,
                 "data", order
         ));
     }
 
-    @PostMapping("/{id}/check_payment")
+    @PostMapping("/{id}/check_payment") // keep id here — needed to find the order
     public ResponseEntity<Order> checkPayment(
             @PathVariable Long id,
             @RequestBody CheckPaymentRequest request) {
